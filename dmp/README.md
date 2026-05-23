@@ -14,9 +14,9 @@ GPU-batched PI² for learning DMP policies, with two registered scenarios:
 python scripts/generate_data.py --scenario insertion \
     --output-dir results/ins_v0 --n-runs 10
 python scripts/train_policy.py  --scenario insertion \
-    --data-dir results/ins_v0 --model-name model --n-basis 20
+    --data-dir results/ins_v0 --model-name model --n-basis 15
 python scripts/test_policy.py   --scenario insertion \
-    --data-dir results/ins_v0 --model-name model --n-basis 20
+    --data-dir results/ins_v0 --model-name model --n-basis 15
 
 # Avoidance (default, no flag needed)
 python scripts/generate_data.py --output-dir results/av_v0 --n-runs 10
@@ -28,12 +28,12 @@ in `core/scenarios.py` plus one line in `_DATAGEN_CFG` in
 `scripts/generate_data.py`.
 
 ## Layout
-
+```
 configs/   typed dataclass configs (tyro-driven CLIs)
 core/      DMP wrapper, PI² optimizer, cost fns, scenario registry, NN policy
 scripts/   generate_data / train_policy / test_policy entry points
 results/   gitignored; PI² runs + trained models land here
-
+```
 ## Dependencies
 
 - `mp_pytorch` fork: https://github.com/domi20u/MP_PyTorch.git
