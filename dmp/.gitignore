@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# PI² / NN outputs — regeneratable, can be huge
+results/**/train*/
+results/**/tests/
+#results/**/*.pth
+results/**/*.npz
+results/**/graphics/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
