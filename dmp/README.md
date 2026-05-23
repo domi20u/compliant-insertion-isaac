@@ -4,8 +4,7 @@ GPU-batched PI² for learning DMP policies, with two registered scenarios:
 
 - `avoidance` — three task params (height, two y-borders), 11 basis fns
 - `insertion` — two task params (height, slot-opening y); slot bottom
-  is pinned to `L_demo - goal_proximity`. 20 basis fns by default,
-  with a verticality penalty on the final descent.
+  is pinned to `L_demo - goal_proximity`. 15 basis fns by default.
 
 ## Quick start
 
