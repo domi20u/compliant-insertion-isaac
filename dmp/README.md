@@ -36,5 +36,5 @@ results/   gitignored; PI² runs + trained models land here
 ```
 ## Dependencies
 
-- `mp_pytorch` fork: https://github.com/domi20u/MP_PyTorch.git
+- `mp_pytorch` fork at https://github.com/domi20u/MP_PyTorch.git
 - `torch`, `numpy`, `tyro`, `addict`, `matplotlib`
