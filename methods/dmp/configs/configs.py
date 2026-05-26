@@ -5,6 +5,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Tuple
 
+from pathlib import Path
+
+# Resolve paths relative to the repo root regardless of where the script runs.
+# configs.py lives at methods/dmp/configs/configs.py, so parents[2] is the repo root.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _repo_path(rel: str) -> str:
+    """Convert a repo-relative path into an absolute string."""
+    return str(_REPO_ROOT / rel)
+
 # ---------------------------------------------------------------------------
 # DMP configuration
 # ---------------------------------------------------------------------------
@@ -18,7 +29,7 @@ class DMPConfig:
     K: float = 25.0                       # spring constant -> alpha (beta = alpha/4)
     alpha_phase: float = 2.0              # canonical-system decay
     basis_bandwidth_factor: float = 0.5   # ~ dmp_pp's h_=0.5
-    trajectory_file: str = "poly_traj_3.csv"
+    trajectory_file: str = field(default_factory=lambda: _repo_path("assets/trajectories/poly_traj_3.csv"))
     ridge_reg: float = 1e-6
     use_improved: bool = False                 # use ImprovedDMP forward model
     rescale: str | None = None                # 'rotodilatation' | 'diagonal' | None
@@ -199,6 +210,6 @@ class TestConfig:
 
     data_dir: Path = Path("results/default")
     model_name: str = "model"
-    trajectory_file: str = "poly_traj_3.csv"
+    trajectory_file: str = field(default_factory=lambda: _repo_path("assets/trajectories/poly_traj_3.csv"))
     device: str = "cuda"
     seed: int = 42

@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "compliant-insertion-isaac"
+version = "0.0.1"
+description = "DMP, diffusion, and residual-RL baselines for compliant peg-in-hole insertion in Isaac Lab"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "torch",
+    "tyro",
+    "addict",
+    "matplotlib",
+    # mp_pytorch fork installed separately — see methods/dmp/README.md
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["compliant_insertion*"]
+
+# DMP code under methods/dmp/ keeps its own sys.path approach for now; it's
+# only promoted to a real package if/when other methods need to import from it.

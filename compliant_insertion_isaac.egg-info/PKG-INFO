@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: compliant-insertion-isaac
+Version: 0.0.1
+Summary: DMP, diffusion, and residual-RL baselines for compliant peg-in-hole insertion in Isaac Lab
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: numpy
+Requires-Dist: torch
+Requires-Dist: tyro
+Requires-Dist: addict
+Requires-Dist: matplotlib
+
+# compliant-insertion-isaac
+
+Benchmarking DMP, Diffusion Policy and residual RL for contact-rich peg-in-hole insertion in Isaac Lab.
