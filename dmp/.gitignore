@@ -11,6 +11,7 @@ results/**/tests/
 #results/**/*.pth
 results/**/*.npz
 results/**/graphics/
+results/**/*.png
 
 # Editors / OS
 .vscode/
