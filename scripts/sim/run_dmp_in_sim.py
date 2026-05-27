@@ -76,7 +76,7 @@ import numpy as np
 import torch
 
 import isaaclab.sim as sim_utils
-from isaaclab.assets import Articulation
+from isaaclab.assets import Articulation, RigidObject
 from isaaclab.controllers import OperationalSpaceController, OperationalSpaceControllerCfg
 from isaaclab.markers import VisualizationMarkers
 from isaaclab.markers.config import FRAME_MARKER_CFG
@@ -93,6 +93,9 @@ from compliant_insertion.env.scene_cfg import (
     InsertionSceneCfg,
     SOCKET_X, SOCKET_Y, SOCKET_TOP_Z,
     PEG_LENGTH,
+    peg_pose_from_hand,
+    peg_tip_pose_from_hand,
+    insertion_success,
 )
 
 
@@ -193,10 +196,12 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     """Runs the simulation loop."""
 
     robot: Articulation = scene["robot"]
+    peg: RigidObject = scene["peg"]
     ee_frame_name = "panda_hand"
     arm_joint_names = ["panda_joint.*"]
     ee_frame_idx = robot.find_bodies(ee_frame_name)[0][0]
     arm_joint_ids = robot.find_joints(arm_joint_names)[0]
+    
 
     # ----- Build the OSC -----
     osc_cfg = OperationalSpaceControllerCfg(
@@ -284,6 +289,11 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
             robot.write_data_to_sim()
             robot.reset()
             robot.update(sim_dt)
+            #hand_pos_w = robot.data.body_pos_w[:, ee_frame_idx]
+            #hand_quat_w = robot.data.body_quat_w[:, ee_frame_idx]
+            #peg_pos_w, peg_quat_w = peg_pose_from_hand(hand_pos_w, hand_quat_w)
+            #peg_pose_w = torch.cat([peg_pos_w, peg_quat_w], dim=-1)
+            #peg.write_root_pose_to_sim(peg_pose_w)
             cycle_step = 0
             dmp_clock = 0.0
             print(f"[run] reset at step {count}")
@@ -309,6 +319,14 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
             root_pose_w, ee_pose_w, joint_pos, joint_vel,
         ) = update_states(sim, scene, robot, ee_frame_idx, arm_joint_ids)
 
+        tip_pos_w = peg_tip_pose_from_hand(ee_pose_w[:, 0:3], ee_pose_w[:, 3:7])
+        success, lateral_err, depth_frac = insertion_success(tip_pos_w)
+
+        if count % 50 == 0:
+            print(f"[insert] tip_z={tip_pos_w[0, 2]:.3f} "
+                f"lateral={lateral_err[0]*1000:.1f}mm "
+                f"depth_frac={depth_frac[0]:+.2f} "
+                f"success={bool(success[0])}")
         # On reset steps, re-prime the OSC with the current EE pose. Other
         # steps just stream the new command — OSC.set_command is cheap.
         if is_reset_step:
@@ -354,6 +372,11 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
 
         sim.step(render=True)
         robot.update(sim_dt)
+        #hand_pos_w = robot.data.body_pos_w[:, ee_frame_idx]
+        #hand_quat_w = robot.data.body_quat_w[:, ee_frame_idx]
+        #peg_pos_w, peg_quat_w = peg_pose_from_hand(hand_pos_w, hand_quat_w)
+        #peg_pose_w = torch.cat([peg_pos_w, peg_quat_w], dim=-1)
+        #peg.write_root_pose_to_sim(peg_pose_w)
         scene.update(sim_dt)
         count += 1
         cycle_step += 1
