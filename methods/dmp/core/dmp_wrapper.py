@@ -1,17 +1,27 @@
 """Thin wrapper around MP_PyTorch's DMP that exposes the operations PI² needs.
 
-Specifically, this module provides:
+Targets the *flat* DMP (mp_type='dmp') only. The fork adds two features to
+that class which this wrapper exposes:
 
-1. **Imitation fit** via ridge regression on the forcing-term targets (since
-   ``mp_pytorch.mp.dmp.DMP.learn_mp_params_from_trajs`` raises NotImplementedError).
-2. **Batched rollout** of N candidate weight vectors in a single forward pass
-   on the GPU.
-3. A clean weights API (`set_weights`/`get_weights`) that hides MP_PyTorch's
-   flat ``params`` layout (which interleaves weights and goal per DOF).
-4. A ``use_rotodilatation`` flag that is wired through but currently asserts
-   off — placeholder for when the MP_PyTorch fork gains rotodilatation.
+1. **Rotation invariance** via the ``rescale`` flag and
+   ``set_learned_endpoints``. When on, the forcing term is roto-dilatated at
+   rollout time so the demo's shape follows the runtime (init_pos -> goal)
+   displacement.
+
+2. **Step-wise execution** via ``reset_state(...)`` and ``step(dt)`` for
+   closed-loop or early-terminating rollouts.
+
+The wrapper itself adds:
+
+- Imitation fit via ridge regression on the forcing-term targets (upstream's
+  ``learn_mp_params_from_trajs`` raises NotImplementedError).
+- Batched rollout of N candidate weight vectors in a single forward pass.
+- A clean weights API (``set_weights``/``get_weights``) that hides MP_PyTorch's
+  flat ``params`` layout (which interleaves weights and goal per DOF).
 """
 from __future__ import annotations
+
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -22,7 +32,7 @@ from configs.configs import DMPConfig
 
 
 class DMPWrapper:
-    """A batched DMP wrapper backed by MP_PyTorch."""
+    """A batched DMP wrapper backed by MP_PyTorch's flat DMP."""
 
     def __init__(self, cfg: DMPConfig, device: str = "cuda",
                  dtype: torch.dtype = torch.float32):
@@ -30,20 +40,36 @@ class DMPWrapper:
         self.device = torch.device(device)
         self.dtype = dtype
 
-        if cfg.use_rotodilatation:
-            raise NotImplementedError(
-                "Rotodilatation is not yet implemented in the MP_PyTorch fork. "
-                "Set DMPConfig.use_rotodilatation=False."
-            )
+        # Resolve the rescale mode from the config. ``cfg.rescale`` takes
+        # precedence; for backward compatibility ``cfg.use_rotodilatation``
+        # turns it on with the default mode if rescale is not set.
+        rescale = getattr(cfg, "rescale", None)
+        if rescale is None and getattr(cfg, "use_rotodilatation", False):
+            rescale = "rotodilatation"
+        if rescale not in (None, "rotodilatation", "rotodilatation_xy"):
+            raise ValueError(
+                f"DMPConfig.rescale must be None, 'rotodilatation', or "
+                f"'rotodilatation_xy' (got {rescale!r}).")
+        self._rescale = rescale
 
         # Loaded by ``imitate_path``
-        self.tau: float | None = None
-        self.x_0: torch.Tensor | None = None
-        self.x_goal: torch.Tensor | None = None
-        self.times_demo: torch.Tensor | None = None
-        self.demo: torch.Tensor | None = None
-        self.learned_L: float | None = None
-        self.weights_init: torch.Tensor | None = None  # [num_dof, num_basis]
+        self.tau: Optional[float] = None
+        # x_0 / x_goal are the *runtime* endpoints — what the next rollout
+        # will start/end at. They are initialized from the demo by
+        # ``imitate_path`` but callers are free (and expected) to overwrite
+        # them with task-specific values before each rollout.
+        self.x_0: Optional[torch.Tensor] = None
+        self.x_goal: Optional[torch.Tensor] = None
+        # x_0_demo / x_goal_demo are the *learned* endpoints — fixed once
+        # at imitation time and used by rotodilatation to compute the
+        # source displacement. They MUST NOT be overwritten by callers;
+        # touching them invalidates the forcing-term rescaling.
+        self.x_0_demo: Optional[torch.Tensor] = None
+        self.x_goal_demo: Optional[torch.Tensor] = None
+        self.times_demo: Optional[torch.Tensor] = None
+        self.demo: Optional[torch.Tensor] = None
+        self.learned_L: Optional[float] = None
+        self.weights_init: Optional[torch.Tensor] = None  # [num_dof, num_basis]
         self.mp = None  # MP_PyTorch DMP, built lazily by _build_mp
 
     # ------------------------------------------------------------------ utils
@@ -76,6 +102,7 @@ class DMPWrapper:
         config.device = str(self.device)
         config.dtype = self.dtype
 
+        config.mp_type = "dmp"
         config.mp_args.num_basis = self.num_basis
         config.mp_args.basis_bandwidth_factor = self.cfg.basis_bandwidth_factor
         config.mp_args.num_basis_outside = 0
@@ -84,28 +111,19 @@ class DMPWrapper:
         config.mp_args.dt = float(self.tau / self.times_demo.shape[-1])
         config.mp_args.weights_scale = 1.0
         config.mp_args.goal_scale = 1.0
-        config.mp_args.relative_goal = False
-
-        if self.cfg.use_improved:
-            config.mp_type = 'transformation_dmp' #"transformation_dmp" #'improved_dmp'
-            # Resolve rescale from either flag (rescale takes precedence)
-            rescale = self.cfg.rescale
-            if rescale is None and self.cfg.use_rotodilatation:
-                rescale = "rotodilatation"
-            config.mp_args.rescale = rescale
-            # Learned endpoints — only meaningful when rescale != None.
-            # We set these after imitation, so they may be None on first build.
-            if self.x_0 is not None and self.x_goal is not None and rescale is not None:
-                config.mp_args.learned_start = self.x_0
-                config.mp_args.learned_goal = self.x_goal
-        else:
-            config.mp_type = "dmp"
+        if self._rescale is not None:
+            config.mp_args.rescale = self._rescale
 
         self.mp = MPFactory.init_mp(**config.to_dict())
 
-        if self.cfg.use_improved and self.cfg.rescale is not None \
-                and self.x_0 is not None and self.x_goal is not None:
-            self.mp.set_learned_endpoints(self.x_0, self.x_goal)
+        # Register the *demo* endpoints (the rotodilatation source frame).
+        # These are stored in x_0_demo / x_goal_demo by ``imitate_path``
+        # and are deliberately kept separate from x_0 / x_goal so the
+        # caller can overwrite the runtime endpoints freely between
+        # rollouts without invalidating rotodilatation.
+        if self._rescale is not None \
+                and self.x_0_demo is not None and self.x_goal_demo is not None:
+            self.mp.set_learned_endpoints(self.x_0_demo, self.x_goal_demo)
 
     # ---------------------------------------------------------------- imitate
     def imitate_path(self, trajectory_file: str) -> torch.Tensor:
@@ -123,8 +141,15 @@ class DMPWrapper:
         xs = traj[:, 1:1 + n_dof]
 
         self.tau = float(t[-1] - t[0])
-        self.x_0 = torch.tensor(xs[0], dtype=self.dtype, device=self.device)
-        self.x_goal = torch.tensor(xs[-1], dtype=self.dtype, device=self.device)
+
+        # Store the demo's endpoints in the demo-only slots. These define
+        # the rotodilatation source frame and must not be modified later.
+        self.x_0_demo = torch.tensor(xs[0], dtype=self.dtype, device=self.device)
+        self.x_goal_demo = torch.tensor(xs[-1], dtype=self.dtype, device=self.device)
+        # Initialize the runtime endpoints to the demo's so a default
+        # rollout reproduces the demo. Callers override these freely.
+        self.x_0 = self.x_0_demo.clone()
+        self.x_goal = self.x_goal_demo.clone()
         self.learned_L = float(np.linalg.norm(xs[-1] - xs[0]))
 
         # batch dim = 1 for fitting
@@ -135,18 +160,15 @@ class DMPWrapper:
 
         self._build_mp(batch=1)
 
-        # If rotodilatation is on, register the learned endpoints with the MP
-        # AFTER the build (the build may not have had them yet).
-        if self.cfg.use_improved and self.cfg.rescale is not None:
-            self.mp.set_learned_endpoints(self.x_0, self.x_goal)
+        # _build_mp already registered the demo endpoints via x_0_demo /
+        # x_goal_demo, but they may have been None on a prior partial
+        # init. Re-register defensively so this is robust to call order.
+        if self._rescale is not None:
+            self.mp.set_learned_endpoints(self.x_0_demo, self.x_goal_demo)
 
         with torch.no_grad():
-            if self.cfg.use_improved:
-                weights_flat = self._fit_weights_ridge_improved(
-                    self.times_demo, self.demo, reg=self.cfg.ridge_reg)
-            else:
-                weights_flat = self._fit_weights_ridge(
-                    self.times_demo, self.demo, reg=self.cfg.ridge_reg)
+            weights_flat = self._fit_weights_ridge(
+                self.times_demo, self.demo, reg=self.cfg.ridge_reg)
 
         weights_init = self._params_to_weights(weights_flat)[0]
         self.weights_init = weights_init.contiguous()
@@ -172,58 +194,15 @@ class DMPWrapper:
         wg = wg / wgs.view(1, 1, K + 1)
         return wg.reshape(B, D * (K + 1))
 
-    def _fit_weights_ridge_improved(self, times, demos, reg):
-        """Ridge fit for the ImprovedDMP formulation.
-
-        Differences from the vanilla _fit_weights_ridge:
-        - regressor Phi uses NORMALIZED basis: psi / sum(psi), times phase s.
-        - target adds the transient term +alpha*beta*(g - x_0)*s.
-        """
-        B, T, D = demos.shape
-        tau = self.mp.phase_gn.tau
-        tau_b = tau.expand(B) if tau.dim() == 0 else tau
-
-        dt = (times[:, 1:] - times[:, :-1]).unsqueeze(-1)
-        vel = torch.zeros_like(demos)
-        vel[:, :-1] = (demos[:, 1:] - demos[:, :-1]) / dt
-        vel[:, -1] = vel[:, -2]
-        acc = torch.zeros_like(demos)
-        acc[:, :-1] = (vel[:, 1:] - vel[:, :-1]) / dt
-        acc[:, -1] = acc[:, -2]
-
-        tau_view = tau_b.view(B, 1, 1)
-        vel_s = vel * tau_view
-        acc_s = acc * (tau_view ** 2)
-
-        x_0  = demos[:, 0, :]
-        goal = demos[:, -1, :]
-
-        # Normalized basis * phase  ->  Phi
-        psi = self.mp.basis_gn.basis(times)                     # [B, T, K]
-        s   = self.mp.phase_gn.phase(times)                     # [B, T]
-        psi_sum  = psi.sum(dim=-1, keepdim=True).clamp_min(1e-30)
-        psi_norm = psi / psi_sum
-        Phi = psi_norm * s.unsqueeze(-1)                        # [B, T, K]
-
-        # Improved-formulation target: vanilla target + transient cancellation
-        transient = self.mp.alpha * self.mp.beta * \
-                    (goal - x_0).unsqueeze(1) * s.unsqueeze(-1)  # [B, T, D]
-        f_target = acc_s \
-                - self.mp.alpha * (self.mp.beta * (goal.unsqueeze(1) - demos)
-                                    - vel_s) \
-                + transient                                   # [B, T, D]
-
-        K = Phi.shape[-1]
-        eye = torch.eye(K, dtype=self.dtype, device=self.device) * reg
-        A   = Phi.transpose(-1, -2) @ Phi + eye                  # [B, K, K]
-        rhs = Phi.transpose(-1, -2) @ f_target                   # [B, K, D]
-        weights = torch.linalg.solve(A, rhs).transpose(-1, -2)   # [B, D, K]
-
-        return self._weights_to_params(weights, goal)
-    
     def _fit_weights_ridge(self, times: torch.Tensor, demos: torch.Tensor,
                            reg: float) -> torch.Tensor:
-        """Ridge fit. Returns flat params [B, D*(K+1)] ready for MP_PyTorch."""
+        """Ridge fit. Returns flat params [B, D*(K+1)] ready for MP_PyTorch.
+
+        Operates in the learned frame: when rotodilatation is on, the
+        rollout-side transform is identity at imitation time (because the
+        runtime endpoints equal the learned ones), so the regression target
+        is unchanged.
+        """
         B, T, D = demos.shape
         tau = self.mp.phase_gn.tau
         tau_b = tau.expand(B) if tau.dim() == 0 else tau
@@ -259,31 +238,56 @@ class DMPWrapper:
 
     # ----------------------------------------------------------- batch rollout
     def rollout_batch(self, weights_batch: torch.Tensor,
-                      n_timesteps: int | None = None) -> dict:
+                      n_timesteps: Optional[int] = None,
+                      x_0: Optional[torch.Tensor] = None,
+                      x_goal: Optional[torch.Tensor] = None) -> dict:
         """Roll out N DMPs in parallel on GPU.
 
         Args:
             weights_batch: [N, num_dof, num_basis] tensor.
-            n_timesteps:   number of points in the rollout. Defaults to demo length.
+            n_timesteps:   number of points in the rollout. Defaults to
+                demo length.
+            x_0:           runtime start [num_dof] or [N, num_dof].
+                Defaults to the learned start.
+            x_goal:        runtime goal  [num_dof] or [N, num_dof].
+                Defaults to the learned goal.
 
         Returns:
             dict with keys 'pos' [N, T, D], 'vel' [N, T, D], 'times' [N, T].
+
+        When rotodilatation is enabled and x_0/x_goal differ from the
+        learned endpoints, the trajectory shape is rotated and scaled
+        accordingly.
         """
         N = weights_batch.shape[0]
         T = n_timesteps or self.times_demo.shape[-1]
 
+        # Resolve runtime endpoints (broadcast scalar inputs to the batch).
+        if x_0 is None:
+            x_0 = self.x_0
+        x_0 = torch.as_tensor(x_0, dtype=self.dtype, device=self.device)
+        if x_0.ndim == 1:
+            x_0 = x_0.unsqueeze(0).expand(N, -1).contiguous()
+
+        if x_goal is None:
+            x_goal = self.x_goal
+        x_goal = torch.as_tensor(x_goal, dtype=self.dtype, device=self.device)
+        if x_goal.ndim == 1:
+            x_goal = x_goal.unsqueeze(0).expand(N, -1).contiguous()
+
         # Build/rebuild the MP for this batch size
         self._build_mp(batch=N)
 
-        # Goal stays at the demo goal; PI² perturbs only weights, not goal
-        goal = self.x_goal.unsqueeze(0).expand(N, -1).contiguous()
-        params = self._weights_to_params(weights_batch, goal)
+        # Goal field of params drives the attractor; PI² perturbs only
+        # weights, so we plug x_goal in (per-batch) and leave weights as
+        # the freely-varying piece.
+        params = self._weights_to_params(weights_batch, x_goal)
 
         # Times, init conditions, all batched
         times = torch.linspace(0.0, self.tau, T, dtype=self.dtype,
                                device=self.device)
         times = times.unsqueeze(0).expand(N, -1).contiguous()
-        init_pos = self.x_0.unsqueeze(0).expand(N, -1).contiguous()
+        init_pos = x_0
         init_vel = torch.zeros_like(init_pos)
         init_time = times[:, 0]
 
@@ -297,3 +301,61 @@ class DMPWrapper:
             "vel": traj["vel"],            # [N, T, D]
             "times": times,                # [N, T]
         }
+
+    # --------------------------------------------------------- step-wise API
+    # For closed-loop control: initialize once, then call ``step(dt)`` per
+    # control tick. The underlying MP is rebuilt for the requested batch
+    # size on each ``reset_step`` so multiple parallel rollouts work.
+    # ----------------------------------------------------------------------
+    def reset_step(self,
+                   weights_batch: torch.Tensor,
+                   x_0: Optional[torch.Tensor] = None,
+                   x_goal: Optional[torch.Tensor] = None,
+                   init_vel: Optional[torch.Tensor] = None,
+                   init_time: float = 0.0) -> None:
+        """Initialize the step-wise integrator.
+
+        Args:
+            weights_batch: [N, num_dof, num_basis] tensor.
+            x_0:    runtime start. See ``rollout_batch``.
+            x_goal: runtime goal. See ``rollout_batch``.
+            init_vel: optional initial velocity [num_dof] or [N, num_dof].
+                Defaults to zeros.
+            init_time: scalar starting time (default 0).
+        """
+        N = weights_batch.shape[0]
+
+        if x_0 is None:
+            x_0 = self.x_0
+        x_0 = torch.as_tensor(x_0, dtype=self.dtype, device=self.device)
+        if x_0.ndim == 1:
+            x_0 = x_0.unsqueeze(0).expand(N, -1).contiguous()
+
+        if x_goal is None:
+            x_goal = self.x_goal
+        x_goal = torch.as_tensor(x_goal, dtype=self.dtype, device=self.device)
+        if x_goal.ndim == 1:
+            x_goal = x_goal.unsqueeze(0).expand(N, -1).contiguous()
+
+        if init_vel is None:
+            init_vel = torch.zeros_like(x_0)
+        else:
+            init_vel = torch.as_tensor(init_vel, dtype=self.dtype, device=self.device)
+            if init_vel.ndim == 1:
+                init_vel = init_vel.unsqueeze(0).expand(N, -1).contiguous()
+
+        self._build_mp(batch=N)
+        params = self._weights_to_params(weights_batch, x_goal)
+        self.mp.reset()
+        self.mp.set_params(params)
+        self.mp.reset_state(init_time=init_time,
+                            init_pos=x_0,
+                            init_vel=init_vel)
+
+    def step(self, dt: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Advance the DMP by one step. Returns (pos, vel) shaped [N, num_dof]."""
+        if self.mp is None or self.mp.step_state is None:
+            raise RuntimeError(
+                "DMPWrapper.step: integrator not initialized. "
+                "Call reset_step(...) first.")
+        return self.mp.step(dt)

@@ -1,0 +1,32 @@
+# Configuration for offline DMP trajectory generation (insertion task).
+#
+# Used by scripts/sim/gen_insertion_trajectory.py. Everything except the
+# two task parameters lives here; pass --task-params P1 P2 at the CLI.
+
+# Paths. Resolved relative to the repo root if not absolute.
+methods_dmp: methods/dmp
+model_path:  assets/dmp_models/insertion_model_2p.pth
+demo_path:   assets/trajectories/traj_demo.csv
+out_path:    assets/trajectories/insertion_sim_rollout.npy
+
+# Trajectory geometry, in the robot base frame (meters).
+# Start and goal differ along Y by default — matches the demonstration axis.
+start: [0.4, 0.3,  0.55]
+goal:  [0.1, 0.3, 0.55]
+
+# DMP hyperparameters. n_basis must match what the NN policy was trained with.
+n_basis: 15
+rescale: rotodilatation_xy   # 'rotodilatation_xy' | 'rotodilatation' | None. See configs.py for details.
+debug_plot: True          # Whether to plot the generated trajectory for debugging.
+# To run the trajectory faster in sim, do NOT down-sample at generation time
+# (that produces staircase commands). Instead, generate at native resolution
+# here and pass --playback-speed 2.0 (or similar) to run_dmp_in_sim.py.
+
+# Insertion-specific offset added to the task parameters before NN input.
+# The NN sees: [task_param_1 + ins_offset[0], task_param_2 - ins_offset[1]]
+# Pass [0.0, 0.0] for the raw task params with no offset.
+ins_offset: [0.0, 0.0]
+
+# Compute device for DMP rollout. 'cuda' falls back to CPU if unavailable.
+device: cuda
+seed: 0

@@ -31,12 +31,7 @@ class DMPConfig:
     basis_bandwidth_factor: float = 0.5   # ~ dmp_pp's h_=0.5
     trajectory_file: str = field(default_factory=lambda: _repo_path("assets/trajectories/poly_traj_3.csv"))
     ridge_reg: float = 1e-6
-    use_improved: bool = False                 # use ImprovedDMP forward model
-    rescale: str | None = None                # 'rotodilatation' | 'diagonal' | None
-    # If True, sets rescale='rotodilatation' (only honored when rescale is None
-    # AND use_improved is True). Kept as a convenience flag; prefer setting
-    # ``rescale`` directly.
-    use_rotodilatation: bool = False
+    rescale: str | None = None               # 'rotodilatation' | 'rotodilatation_xy' | None
 
 
 # ---------------------------------------------------------------------------
