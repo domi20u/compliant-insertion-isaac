@@ -9,7 +9,7 @@ from pathlib import Path
 
 # Resolve paths relative to the repo root regardless of where the script runs.
 # configs.py lives at methods/dmp/configs/configs.py, so parents[2] is the repo root.
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def _repo_path(rel: str) -> str:
