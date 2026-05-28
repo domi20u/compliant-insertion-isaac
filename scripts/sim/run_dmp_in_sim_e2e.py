@@ -39,6 +39,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import dmp
+
 # ─── Step 1: launch Isaac Sim BEFORE any isaaclab.* imports. ─────────────────
 from isaaclab.app import AppLauncher
 
@@ -71,6 +73,12 @@ parser.add_argument("--hold-after-tau", action="store_true", default=True,
                     help="Stop integrating once DMP time exceeds tau and hold "
                          "the last command. On by default; the DMP has "
                          "converged to the goal by then.")
+parser.add_argument("--plot", action="store_true", default=False,
+                    help="Log the executed peg-tip trajectory (descent + DMP "
+                         "phases) and save a figure with start/goal/socket "
+                         "markers after the first completed cycle.")
+parser.add_argument("--plot-path", type=Path, default=Path("trajectory.png"),
+                    help="Output path for the trajectory figure (--plot).")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -87,7 +95,7 @@ import yaml
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.controllers import OperationalSpaceController, OperationalSpaceControllerCfg
-from isaaclab.markers import VisualizationMarkers
+from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.markers.config import FRAME_MARKER_CFG
 from isaaclab.scene import InteractiveScene
 from isaaclab.utils.math import (
@@ -116,10 +124,11 @@ from compliant_insertion.env.scene_cfg import (
 # before descending straight down onto the peg. Keeps the open gripper from
 # clipping the standing peg on the way in.
 APPROACH_CLEARANCE = 0.12
+DMP_TIME_EXTENSION_FACTOR = 1.05  # DMPs run until their internal clock reaches tau * this factor. We may want to extend a little beyond tau to ensure the DMP fully converges to the goal, especially if playback_speed > 1.0.
 
 # DMP transport: peg-tip goal Z when seating. Rim-touch by default; set to
 # SOCKET_BLOCK_TOP_Z to drive fully seated.
-SEAT_TIP_Z = SOCKET_TOP_Z
+SEAT_TIP_Z = SOCKET_TOP_Z         
 
 
 # ─── Config + DMP construction ───────────────────────────────────────────────
@@ -246,6 +255,30 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene,
     ee_marker = VisualizationMarkers(frame_marker_cfg.replace(prim_path="/Visuals/ee_current"))
     goal_marker = VisualizationMarkers(frame_marker_cfg.replace(prim_path="/Visuals/ee_goal"))
 
+    # Static start/goal spheres (DMP endpoints) + an evolving trail of small
+    # spheres that grows as the DMP executes. Colors: green=start, red=goal,
+    # blue=trail. A VisualizationMarkers can render many instances of one prim
+    # by passing N translations to .visualize(), which is how the trail works.
+    def _sphere_marker(prim_path, color, radius):
+        cfg = VisualizationMarkersCfg(
+            prim_path=prim_path,
+            markers={
+                "sphere": sim_utils.SphereCfg(
+                    radius=radius,
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=color),
+                ),
+            },
+        )
+        return VisualizationMarkers(cfg)
+
+    start_marker = _sphere_marker("/Visuals/dmp_start", (0.1, 0.8, 0.1), 0.012)
+    dmp_goal_marker = _sphere_marker("/Visuals/dmp_goal", (0.9, 0.1, 0.1), 0.012)
+    trail_marker = _sphere_marker("/Visuals/dmp_trail", (0.2, 0.4, 0.9), 0.005)
+    # Trail point buffer (world-frame peg-tip positions during DMP phase).
+    trail_pts: list[list[float]] = []
+    TRAIL_MAX = 400          # cap to bound draw cost
+    TRAIL_EVERY = 10          # append every Nth DMP step
+
     sim_dt = sim.get_physics_dt()
     robot.update(dt=sim_dt)
 
@@ -294,6 +327,10 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene,
     dmp.x_0 = pick_tip_w.clone()
     dmp.x_goal = seat_tip_w.clone()
 
+    # Place the static start/goal spheres once (they don't move).
+    start_marker.visualize(translations=pick_tip_w.unsqueeze(0))
+    dmp_goal_marker.visualize(translations=seat_tip_w.unsqueeze(0))
+
     grip_target = finger_grip_target(scene.num_envs, len(finger_ids), sim.device)
     open_target = torch.full(
         (scene.num_envs, len(finger_ids)), 0.04, device=sim.device
@@ -328,11 +365,29 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene,
     last_target_xyz = approach_hand_pos.clone()
     cycle_step = 0
 
+    # ----- Trajectory logging (for --plot). -----
+    traj_log = {"DESCEND": [], "GRASP": [], "DMP": [], "HOLD": []}
+    dmp_start_marker = None      # filled at DMP start (actual post-grasp tip)
+    plot_saved = False
+
     count = 0
     while simulation_app.is_running():
         is_reset_step = (count % args_cli.reset_period) == 0
 
         if is_reset_step:
+            # ----- Save the trajectory figure once, at the first reset AFTER
+            # a full cycle has been logged (count > 0 so a cycle elapsed). -----
+            if args_cli.plot and not plot_saved and count > 0:
+                markers = {
+                    "grasp": tuple(pick_tip_w.detach().cpu().tolist()),
+                    "dmp_goal": tuple(seat_tip_w.detach().cpu().tolist()),
+                    "socket": (SOCKET_X, SOCKET_Y, SOCKET_TOP_Z),
+                }
+                if dmp_start_marker is not None:
+                    markers["dmp_start"] = dmp_start_marker
+                save_trajectory_plot(traj_log, markers, args_cli.plot_path)
+                plot_saved = True
+
             # ----- Periodic reset: arm to default ready pose, peg back on the
             # table at its pick location, fingers open. The phase machine
             # re-runs approach→grasp→DMP from scratch. -----
@@ -355,6 +410,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene,
             dmp_time = 0.0
             dmp_active = False
             last_target_xyz = approach_hand_pos.clone()
+            trail_pts.clear()      # fresh trail each cycle
             print(f"[run] reset at step {count}")
 
         # ----- Phase machine: pick target hand position + finger command. -----
@@ -374,11 +430,14 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene,
             phase = "DMP"
             finger_cmd = grip_target         # sustain grip through transport
             if not dmp_active:
+                actual_tip_w = peg_tip_from_body(peg.data.root_pos_w, peg.data.root_quat_w)[0]
+                dmp.x_0 = actual_tip_w.clone()
+                print(f"[run] DMP x_0 {dmp.x_0.tolist()}, DMP goal {dmp.x_goal.tolist()}")
                 dmp.reset_step(dmp_weights)
                 dmp_active = True
                 dmp_time = 0.0
                 print(f"[run] DMP rollout started at step {count}")
-            if (not args_cli.hold_after_tau) or (dmp_time < tau):
+            if (not args_cli.hold_after_tau) or (dmp_time < DMP_TIME_EXTENSION_FACTOR * tau):
                 step_dt = sim_dt * args_cli.playback_speed
                 tip_pos, _ = dmp.step(step_dt)            # [1, 3] peg-tip target
                 # Convert peg-tip target -> hand target for the OSC.
@@ -409,6 +468,23 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene,
 
         tip_pos_w = peg_tip_from_body(peg.data.root_pos_w, peg.data.root_quat_w)
         success, lateral_err, depth_frac = insertion_success(tip_pos_w)
+
+        # ----- Live DMP trail: grow during the DMP phase. -----
+        if phase == "DMP" and (count % TRAIL_EVERY == 0):
+            trail_pts.append(tip_pos_w[0].detach().cpu().tolist())
+            if len(trail_pts) > TRAIL_MAX:
+                trail_pts.pop(0)
+        if trail_pts:
+            trail_marker.visualize(
+                translations=torch.tensor(trail_pts, device=sim.device)
+            )
+
+        # ----- Trajectory logging for --plot. -----
+        if args_cli.plot and not plot_saved and phase in traj_log:
+            traj_log[phase].append(tip_pos_w[0].detach().cpu().tolist())
+            if phase == "DMP" and dmp_start_marker is None:
+                # Actual peg-tip at the moment transport begins.
+                dmp_start_marker = tuple(tip_pos_w[0].detach().cpu().tolist())
 
         if count % 50 == 0:
             print(f"[{phase}] tip_z={tip_pos_w[0, 2]:.3f} "
@@ -461,6 +537,61 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene,
         scene.update(sim_dt)
         count += 1
         cycle_step += 1
+
+
+def save_trajectory_plot(log, markers, out_path):
+    """Save a 3D figure of the executed peg-tip path with reference markers.
+
+    Args:
+        log: dict phase_name -> list of (x, y, z) world peg-tip positions.
+        markers: dict label -> (x, y, z) reference points (grasp, dmp start,
+            dmp goal, socket).
+        out_path: where to write the PNG.
+    """
+    import matplotlib
+    matplotlib.use("Agg")            # headless-safe
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 — registers 3d proj
+    import numpy as np
+
+    fig = plt.figure(figsize=(9, 7))
+    ax = fig.add_subplot(111, projection="3d")
+
+    phase_colors = {"DESCEND": "tab:blue", "GRASP": "tab:cyan",
+                    "DMP": "tab:orange", "HOLD": "tab:green"}
+    for phase, pts in log.items():
+        if not pts:
+            continue
+        arr = np.asarray(pts)
+        ax.plot(arr[:, 0], arr[:, 1], arr[:, 2], "-",
+                color=phase_colors.get(phase, "gray"), label=phase, lw=1.8)
+
+    marker_styles = {"grasp": ("s", "black"), "dmp_start": ("o", "tab:red"),
+                     "dmp_goal": ("*", "tab:purple"), "socket": ("X", "tab:brown")}
+    for label, (x, y, z) in markers.items():
+        m, c = marker_styles.get(label, ("o", "gray"))
+        ax.scatter([x], [y], [z], marker=m, color=c, s=140, depthshade=False,
+                   label=label)
+
+    ax.set_xlabel("X (m)")
+    ax.set_ylabel("Y (m)")
+    ax.set_zlabel("Z (m)")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(-1, 1)
+    ax.set_zlim(0, 1)
+    ax.set_title("Executed peg-tip trajectory")
+    ax.legend(fontsize=8, loc="best")
+
+    # Equal aspect so the path isn't visually distorted.
+    try:
+        ax.set_box_aspect((1, 1, 1))
+    except Exception:
+        pass
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"[plot] saved trajectory figure to {out_path}")
 
 
 def update_states(

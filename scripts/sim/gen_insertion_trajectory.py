@@ -291,7 +291,7 @@ def main() -> None:
              goal=np.asarray(cfg["goal"]),
              demo_x0=demo_x0, demo_xg=demo_xg,
              task_params=np.asarray(args.task_params),
-             ins_offset=np.asarray(offs),
+             ins_offset=np.asarray(cfg["ins_offset"]),
              rescale=np.asarray(str(cfg["rescale"])))
     np.save(out_path, pos.astype(np.float32))
     print(f"[gen_traj] saved {pos.shape} -> {out_path} (+ .npz metadata)")

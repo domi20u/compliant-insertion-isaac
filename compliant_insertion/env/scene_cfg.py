@@ -124,7 +124,7 @@ RIM_HEIGHT = HOLE_DEPTH
 # the top of whatever the robot is standing relative to; with the `Stand`
 # mount scaled ×2 the Franka base sits such that ~0.36 is a reachable,
 # table-height plane. Both the peg and the socket rest ON this plane.
-TABLE_TOP_Z = 0.36
+TABLE_TOP_Z = 0.0
 
 # ----- Socket location (where the peg gets inserted) -----
 SOCKET_X = 0.45
