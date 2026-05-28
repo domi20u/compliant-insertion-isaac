@@ -73,12 +73,7 @@ parser.add_argument("--hold-after-tau", action="store_true", default=True,
                     help="Stop integrating once DMP time exceeds tau and hold "
                          "the last command. On by default; the DMP has "
                          "converged to the goal by then.")
-parser.add_argument("--plot", action="store_true", default=False,
-                    help="Log the executed peg-tip trajectory (descent + DMP "
-                         "phases) and save a figure with start/goal/socket "
-                         "markers after the first completed cycle.")
-parser.add_argument("--plot-path", type=Path, default=Path("trajectory.png"),
-                    help="Output path for the trajectory figure (--plot).")
+
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -237,11 +232,12 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene,
     osc_cfg = OperationalSpaceControllerCfg(
         target_types=["pose_abs"],
         impedance_mode="fixed",
-        motion_stiffness_task=[200.0, 200.0, 200.0, 30.0, 30.0, 30.0],
+        motion_stiffness_task=[2000.0, 2000.0, 2000.0, 400.0, 400.0, 400.0],
+        #motion_stiffness_task=[200.0, 200.0, 200.0, 30.0, 30.0, 30.0],
         motion_damping_ratio_task=1.0,
         inertial_dynamics_decoupling=True,
         partial_inertial_dynamics_decoupling=False,
-        gravity_compensation=False,
+        gravity_compensation=True,
         motion_control_axes_task=[1, 1, 1, 1, 1, 1],
         nullspace_control="position",
         nullspace_stiffness=5.0,
@@ -283,9 +279,10 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene,
     robot.update(dt=sim_dt)
 
     # ----- Nullspace target -----
-    joint_centers = torch.mean(
-        robot.data.soft_joint_pos_limits[:, arm_joint_ids, :], dim=-1
-    )
+    #joint_centers = torch.mean(
+    #    robot.data.soft_joint_pos_limits[:, arm_joint_ids, :], dim=-1
+    #)
+    joint_centers = robot.data.default_joint_pos[:, arm_joint_ids].clone()
 
     # ----- Read the home-pose hand quaternion (target orientation). -----
     (
@@ -365,29 +362,11 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene,
     last_target_xyz = approach_hand_pos.clone()
     cycle_step = 0
 
-    # ----- Trajectory logging (for --plot). -----
-    traj_log = {"DESCEND": [], "GRASP": [], "DMP": [], "HOLD": []}
-    dmp_start_marker = None      # filled at DMP start (actual post-grasp tip)
-    plot_saved = False
-
     count = 0
     while simulation_app.is_running():
         is_reset_step = (count % args_cli.reset_period) == 0
 
         if is_reset_step:
-            # ----- Save the trajectory figure once, at the first reset AFTER
-            # a full cycle has been logged (count > 0 so a cycle elapsed). -----
-            if args_cli.plot and not plot_saved and count > 0:
-                markers = {
-                    "grasp": tuple(pick_tip_w.detach().cpu().tolist()),
-                    "dmp_goal": tuple(seat_tip_w.detach().cpu().tolist()),
-                    "socket": (SOCKET_X, SOCKET_Y, SOCKET_TOP_Z),
-                }
-                if dmp_start_marker is not None:
-                    markers["dmp_start"] = dmp_start_marker
-                save_trajectory_plot(traj_log, markers, args_cli.plot_path)
-                plot_saved = True
-
             # ----- Periodic reset: arm to default ready pose, peg back on the
             # table at its pick location, fingers open. The phase machine
             # re-runs approach→grasp→DMP from scratch. -----
@@ -479,13 +458,6 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene,
                 translations=torch.tensor(trail_pts, device=sim.device)
             )
 
-        # ----- Trajectory logging for --plot. -----
-        if args_cli.plot and not plot_saved and phase in traj_log:
-            traj_log[phase].append(tip_pos_w[0].detach().cpu().tolist())
-            if phase == "DMP" and dmp_start_marker is None:
-                # Actual peg-tip at the moment transport begins.
-                dmp_start_marker = tuple(tip_pos_w[0].detach().cpu().tolist())
-
         if count % 50 == 0:
             print(f"[{phase}] tip_z={tip_pos_w[0, 2]:.3f} "
                   f"lateral={lateral_err[0]*1000:.1f}mm "
@@ -537,61 +509,6 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene,
         scene.update(sim_dt)
         count += 1
         cycle_step += 1
-
-
-def save_trajectory_plot(log, markers, out_path):
-    """Save a 3D figure of the executed peg-tip path with reference markers.
-
-    Args:
-        log: dict phase_name -> list of (x, y, z) world peg-tip positions.
-        markers: dict label -> (x, y, z) reference points (grasp, dmp start,
-            dmp goal, socket).
-        out_path: where to write the PNG.
-    """
-    import matplotlib
-    matplotlib.use("Agg")            # headless-safe
-    import matplotlib.pyplot as plt
-    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 — registers 3d proj
-    import numpy as np
-
-    fig = plt.figure(figsize=(9, 7))
-    ax = fig.add_subplot(111, projection="3d")
-
-    phase_colors = {"DESCEND": "tab:blue", "GRASP": "tab:cyan",
-                    "DMP": "tab:orange", "HOLD": "tab:green"}
-    for phase, pts in log.items():
-        if not pts:
-            continue
-        arr = np.asarray(pts)
-        ax.plot(arr[:, 0], arr[:, 1], arr[:, 2], "-",
-                color=phase_colors.get(phase, "gray"), label=phase, lw=1.8)
-
-    marker_styles = {"grasp": ("s", "black"), "dmp_start": ("o", "tab:red"),
-                     "dmp_goal": ("*", "tab:purple"), "socket": ("X", "tab:brown")}
-    for label, (x, y, z) in markers.items():
-        m, c = marker_styles.get(label, ("o", "gray"))
-        ax.scatter([x], [y], [z], marker=m, color=c, s=140, depthshade=False,
-                   label=label)
-
-    ax.set_xlabel("X (m)")
-    ax.set_ylabel("Y (m)")
-    ax.set_zlabel("Z (m)")
-    ax.set_xlim(0, 1)
-    ax.set_ylim(-1, 1)
-    ax.set_zlim(0, 1)
-    ax.set_title("Executed peg-tip trajectory")
-    ax.legend(fontsize=8, loc="best")
-
-    # Equal aspect so the path isn't visually distorted.
-    try:
-        ax.set_box_aspect((1, 1, 1))
-    except Exception:
-        pass
-
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-    print(f"[plot] saved trajectory figure to {out_path}")
 
 
 def update_states(

@@ -430,7 +430,7 @@ class InsertionSceneCfg(InteractiveSceneCfg):
     robot.actuators["panda_shoulder"].damping = 0.0
     robot.actuators["panda_forearm"].stiffness = 0.0
     robot.actuators["panda_forearm"].damping = 0.0
-    robot.spawn.rigid_props.disable_gravity = True
+    robot.spawn.rigid_props.disable_gravity = False
     robot.spawn.physics_material = sim_utils.RigidBodyMaterialCfg(
         static_friction=PEG_FRICTION_STATIC,
         dynamic_friction=PEG_FRICTION_DYNAMIC,
