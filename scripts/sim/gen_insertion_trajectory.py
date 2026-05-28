@@ -235,58 +235,34 @@ def main() -> None:
     nn_policy.eval()
     print(f"[gen_traj] loaded NN policy from {cfg['model_path']}")
 
-    # ----- Build DMP and imitate the demo.
-    dmp_cfg = DMPConfig(trajectory_file=str(cfg["demo_path"]),
-                        n_bfs=cfg["n_basis"] - 1, rescale=cfg["rescale"])
-    dmp = DMPWrapper(dmp_cfg, device=str(device))
-    dmp.imitate_path(str(cfg["demo_path"]))
-    init_weights = dmp.weights_init.clone()                      # [D, K]
-    # Capture the demo's endpoints from the wrapper's dedicated demo slots.
-    # x_0 / x_goal also hold these values immediately after imitate_path,
-    # but they get overwritten below — x_0_demo / x_goal_demo do not.
-    demo_x0 = dmp.x_0_demo.detach().cpu().numpy().copy()
-    demo_xg = dmp.x_goal_demo.detach().cpu().numpy().copy()
-    print(f"[gen_traj] imitated demo: weights_init shape={tuple(init_weights.shape)} "
+    # ----- Build DMP + imitate + apply policy weights via the shared
+    # builder, so this script and run_dmp_in_sim_e2e.py prime the DMP
+    # identically (same NN-input encoding, same DOF mapping). -----
+    from core.dmp_policy import build_primed_dmp  # noqa: E402
+    primed = build_primed_dmp(
+        DMPWrapper=DMPWrapper, DMPConfig=DMPConfig,
+        nn_policy=nn_policy,
+        demo_path=str(cfg["demo_path"]),
+        n_basis=cfg["n_basis"],
+        task_params=tuple(args.task_params),
+        ins_offset=tuple(cfg["ins_offset"]),
+        start=np.asarray(cfg["start"], dtype=np.float32),
+        goal=np.asarray(cfg["goal"], dtype=np.float32),
+        rescale=cfg["rescale"],
+        device=device,
+    )
+    dmp = primed.dmp
+    weights_batch = primed.weights                               # [1, D, K]
+    demo_x0 = primed.demo_x0
+    demo_xg = primed.demo_xg
+    print(f"[gen_traj] imitated demo: weights shape={tuple(weights_batch.shape)} "
           f"demo_x0={demo_x0.tolist()} demo_xg={demo_xg.tolist()}")
-
-    # ----- Override start and goal with the config-supplied points.
-    start = torch.tensor(cfg["start"], dtype=dmp.dtype, device=device)
-    goal = torch.tensor(cfg["goal"],   dtype=dmp.dtype, device=device)
-    dmp.x_0 = start.clone()
-    dmp.x_goal = goal.clone()
-    print(f"[gen_traj] start={cfg['start']} goal={cfg['goal']}")
-
-    # ----- Build the NN input: two task params, each shifted by ins_offset.
-    # encoding: [p1 + offset[0], p2 - offset[1]]
-    p1, p2 = args.task_params
-    offs = cfg["ins_offset"]
-    nn_input = np.array([[p1 + offs[0], p2 - offs[1]]], dtype=np.float32)
-    print(f"[gen_traj] task_params={args.task_params} ins_offset={offs} "
-          f"-> nn_input={nn_input.tolist()}")
-    nn_input_t = torch.tensor(nn_input, device=device)
-
-    n_dims = 2   # insertion: NN predicts forcing terms for dofs 1 and 2 (y, z)
-
-    # ----- Predict the y, z forcing-term weights.
-    with torch.no_grad():
-        new_means_flat = nn_policy.predict(nn_input_t)           # [1, K*n_dims]
-
-    expected = cfg["n_basis"] * n_dims
-    if new_means_flat.shape[-1] != expected:
-        raise RuntimeError(
-            f"NN policy output {new_means_flat.shape[-1]} values; expected "
-            f"n_basis*n_dims = {cfg['n_basis']}*{n_dims} = {expected}. Check "
-            f"that n_basis in the config matches the trained model.")
-
-    new_means = new_means_flat.reshape(1, cfg["n_basis"], n_dims)  # [1, K, n_dims]
-
-    # ----- Assemble [N=1, D, K] weight tensor. dof 0 (x) stays at init.
-    weights_batch = init_weights.unsqueeze(0).clone()            # [1, D, K]
-    weights_batch[:, 1, :] = new_means[:, :, 0]
-    weights_batch[:, 2, :] = new_means[:, :, 1]
+    print(f"[gen_traj] start={cfg['start']} goal={cfg['goal']} "
+          f"task_params={args.task_params} ins_offset={cfg['ins_offset']} "
+          f"-> nn_input={primed.nn_input.tolist()}")
 
     # ----- Rollout at the wrapper's native resolution. To play faster in
-    # sim, use --playback-speed in run_dmp_in_sim.py, not a smaller
+    # sim, use --playback-speed in run_dmp_in_sim_e2e.py, not a smaller
     # n_timesteps here. Down-sampling at generation gives the controller
     # a sparse waypoint stream and produces staircase tracking. -----
     roll = dmp.rollout_batch(weights_batch)

@@ -169,6 +169,57 @@ PEG_BASE_OFFSET_HAND = (0.0, 0.0, PEG_BASE_OFFSET_Z)
 # we shift the center up by half the length.
 PEG_BODY_CENTER_HAND_Z = PEG_BASE_OFFSET_Z + PEG_LENGTH / 2
 
+# ─── Grasp / friction parameters ──────────────────────────────────────────────
+# The peg is a DYNAMIC body held by friction. These coefficients are high on
+# purpose: a 50 g cylinder gripped by two small fingertip patches will slip at
+# default (~0.5) friction the moment insertion reaction load arrives. Values
+# around 1.0–1.5 are typical for "rubberized fingertip on metal peg" in sim and
+# keep the grasp stable through insertion. Raise PEG_FRICTION if you still see
+# slip; lower it if the peg sticks unrealistically.
+PEG_FRICTION_STATIC = 1.2
+PEG_FRICTION_DYNAMIC = 1.0
+PEG_RESTITUTION = 0.0  # no bounce — dead contacts settle faster
+
+
+def peg_grasp_pose_from_hand(hand_pos_w, hand_quat_w):
+    """World pose to PLACE the dynamic peg for a clean pinch grasp.
+
+    Same geometry as peg_pose_from_hand (body center at PEG_BODY_CENTER_HAND_Z
+    along the hand +Z), but named separately because its role is different:
+    this is used ONCE at grasp time (and on each reset's held-state write) to
+    position the peg centered between the fingers, NOT to drive it every step.
+    After the grasp is established, the peg moves under contact dynamics alone.
+    """
+    import torch
+    from isaaclab.utils.math import quat_apply
+
+    offset_hand = torch.tensor(
+        [0.0, 0.0, PEG_BODY_CENTER_HAND_Z],
+        device=hand_pos_w.device,
+        dtype=hand_pos_w.dtype,
+    ).expand_as(hand_pos_w)
+    offset_w = quat_apply(hand_quat_w, offset_hand)
+    return hand_pos_w + offset_w, hand_quat_w
+
+
+def peg_tip_from_body(peg_pos_w, peg_quat_w):
+    """Tip position from the DYNAMIC peg's own body pose.
+
+    Use this (not peg_tip_pose_from_hand) for the success check once the peg
+    is grasped: it reflects where the tip ACTUALLY is, including any grasp
+    compliance / slip / wobble. The tip is +PEG_LENGTH/2 along the peg's
+    local +Z from its body center.
+    """
+    import torch
+    from isaaclab.utils.math import quat_apply
+
+    half_len = torch.tensor(
+        [0.0, 0.0, PEG_LENGTH / 2],
+        device=peg_pos_w.device,
+        dtype=peg_pos_w.dtype,
+    ).expand_as(peg_pos_w)
+    return peg_pos_w + quat_apply(peg_quat_w, half_len)
+
 # ─── Rim wall poses ──────────────────────────────────────────────────────────
 # Four walls, axis-aligned, surrounding a square that inscribes the hole.
 # Each wall is a thin slab; together they leave a square void of side
@@ -409,17 +460,57 @@ class InsertionSceneCfg(InteractiveSceneCfg):
     robot.actuators["panda_forearm"].damping = 0.0
     robot.spawn.rigid_props.disable_gravity = True
 
-    
+    # Fingertip friction must be high too — the realized contact friction is
+    # the combination of both materials, so a high-friction peg against
+    # default fingers still slips. Match the peg's coefficients on the hand.
+    robot.spawn.physics_material = sim_utils.RigidBodyMaterialCfg(
+        static_friction=PEG_FRICTION_STATIC,
+        dynamic_friction=PEG_FRICTION_DYNAMIC,
+        restitution=PEG_RESTITUTION,
+    )
 
-    # ----- Peg (world-level kinematic rigid body, pose-driven from the hand) -----
-    # Spawned at the home-pose tip location so it appears already "grasped" at
-    # sim start. The run loop overwrites its pose each step from the hand's
-    # current pose plus the offsets above — see peg_pose_from_hand() below.
+    # ----- Initial joint configuration -----
+    # Override the default Franka "ready" pose so the arm starts to the side
+    # of the socket, not above it — this matches the spirit of a DMP rollout
+    # where the start pose is "after grasping the peg, before approaching".
     #
-    # kinematic_enabled=True means the peg ignores forces and only moves when
-    # we explicitly write its pose. disable_gravity=True is belt-and-braces
-    # in case kinematic_enabled is silently ignored on some Isaac Sim
-    # versions.
+    # These angles were tuned by hand against the current socket position
+    # (SOCKET_X=0.4, SOCKET_Y=0.3). They put the hand roughly at
+    # (x≈0.4, y≈0.1, z≈0.51) in base frame — i.e. 20 cm to the −Y side of
+    # the socket, ~10 cm above the rim top — pointing down with the same
+    # orientation as the default ready pose. Adjust if you reposition the
+    # socket or want a different start.
+    #
+    # If you want a true Cartesian start specification ("hand at exactly
+    # this XYZ"), the right next step is to run an IK solver once offline
+    # (Isaac Lab's `DifferentialIKController` or `pinocchio`) and paste
+    # the resulting joint angles here. For pass-2 the hand-tuned values
+    # below are good enough; the DMP doesn't care that the start is
+    # 5 mm off as long as it's reproducible.
+    robot.init_state.joint_pos = {
+        "panda_joint1": 0.6,     # rotate base toward +X+Y quadrant
+        "panda_joint2": 0.3,     # shoulder pitch up (less squat than default)
+        "panda_joint3": 0.0,
+        "panda_joint4": -2.0,    # less elbow bend (was -2.81)
+        "panda_joint5": 0.0,
+        "panda_joint6": 2.3,     # wrist pitch to keep tip pointing down
+        "panda_joint7": 0.741,   # default wrist roll (peg is symmetric)
+        # Fingers — close them so the gripper "holds" the peg visually.
+        "panda_finger_joint1": 0.0,
+        "panda_finger_joint2": 0.0,
+    }
+
+    # ----- Peg (DYNAMIC rigid body, held by friction) -----
+    # The peg is a normal dynamic body now. It is grasped once at startup and
+    # the held-state is re-established on each reset (see the runner's reset
+    # logic). From the moment of grasp onward, the peg's motion is determined
+    # purely by contact: fingertip friction holding it, socket walls resisting
+    # it during insertion. A jam or a slip therefore manifests as a shallow
+    # final seating depth — which is exactly the (single) success signal we
+    # measure on the peg's OWN body pose via peg_tip_from_body().
+    #
+    # High friction is essential: a 50 g peg on two small contact patches will
+    # slip at default friction the instant insertion load arrives.
     peg = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/Peg",
         spawn=sim_utils.CylinderCfg(
@@ -428,13 +519,21 @@ class InsertionSceneCfg(InteractiveSceneCfg):
             mass_props=sim_utils.MassPropertiesCfg(mass=0.05),
             collision_props=sim_utils.CollisionPropertiesCfg(),
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.8, 0.6, 0.2)),
+            physics_material=sim_utils.RigidBodyMaterialCfg(
+                static_friction=PEG_FRICTION_STATIC,
+                dynamic_friction=PEG_FRICTION_DYNAMIC,
+                restitution=PEG_RESTITUTION,
+            ),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                kinematic_enabled=True,
-                disable_gravity=True,
+                # Dynamic: no kinematic flag, gravity ON. Solver iteration
+                # counts bumped for stable two-patch grasp contacts.
+                solver_position_iteration_count=16,
+                solver_velocity_iteration_count=1,
+                max_depenetration_velocity=1.0,
             ),
         ),
-        # Initial pose is a placeholder — the run loop overwrites it on the
-        # first step. We just need somewhere non-colliding to spawn.
+        # Placeholder spawn; the runner writes the real grasp pose on the
+        # first reset (peg centered between the fingers).
         init_state=RigidObjectCfg.InitialStateCfg(
             pos=(0.0, 0.0, 1.0),
         ),
