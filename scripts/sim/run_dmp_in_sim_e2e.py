@@ -100,18 +100,26 @@ from isaaclab.utils.math import (
 
 from compliant_insertion.env.scene_cfg import (
     InsertionSceneCfg,
-    SOCKET_X, SOCKET_Y, SOCKET_TOP_Z,
-    PEG_LENGTH,
-    peg_pose_from_hand,
-    peg_tip_pose_from_hand,
+    SOCKET_X, SOCKET_Y, SOCKET_TOP_Z, SOCKET_BLOCK_TOP_Z,
+    PEG_LENGTH, PEG_PLACE_POS,
+    PEG_BODY_CENTER_HAND_Z, PEG_TIP_OFFSET_Z,
+    GRIPPER_DOWN_QUAT,
     insertion_success,
+    peg_tip_from_body,
+    hand_pos_for_grasp, hand_pos_for_peg_tip,
+    finger_grip_target,
 )
 
 
-# ─── Static-hold target (pre-rollout hover). ─────────────────────────────────
-HOVER_OFFSET = 0.10
-HAND_TARGET_Z = SOCKET_TOP_Z + HOVER_OFFSET + PEG_LENGTH
-STATIC_TARGET_POS = (SOCKET_X, SOCKET_Y, HAND_TARGET_Z)
+# ─── Phase geometry ──────────────────────────────────────────────────────────
+# Approach height: how far above the grasp pose the gripper first moves to,
+# before descending straight down onto the peg. Keeps the open gripper from
+# clipping the standing peg on the way in.
+APPROACH_CLEARANCE = 0.12
+
+# DMP transport: peg-tip goal Z when seating. Rim-touch by default; set to
+# SOCKET_BLOCK_TOP_Z to drive fully seated.
+SEAT_TIP_Z = SOCKET_TOP_Z
 
 
 # ─── Config + DMP construction ───────────────────────────────────────────────
@@ -205,7 +213,8 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene,
     """Runs the simulation loop with step-wise DMP execution."""
 
     robot: Articulation = scene["robot"]
-    peg: RigidObject = scene["peg"]
+    peg = scene["peg"]
+    finger_ids, _ = robot.find_joints(["panda_finger_joint.*"])
     ee_frame_name = "panda_hand"
     arm_joint_names = ["panda_joint.*"]
     ee_frame_idx = robot.find_bodies(ee_frame_name)[0][0]
@@ -253,42 +262,80 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene,
     print(f"[info] home ee pose (base frame): "
           f"pos={ee_pose_b[0, 0:3].tolist()}, quat(wxyz)={home_quat_b.tolist()}")
 
-    # ----- Sanity check: does the DMP start near the static hover pose? -----
-    dmp_start = dmp.x_0.detach().cpu().numpy()
-    start_err = float(np.linalg.norm(
-        dmp_start - np.asarray(STATIC_TARGET_POS, dtype=dmp_start.dtype)))
-    if start_err > 0.05:
-        print(f"[warn] DMP start is {start_err*100:.1f} cm from the static-hold "
-              f"target — expect a jerk at step {args_cli.rollout_start_step}. "
-              f"Set the config 'start' to match the hover position.")
-    # How many sim ticks the motion will take at this playback speed.
+    # ----- Fixed down-pointing target orientation (base frame) -----
+    # The peg is carried vertically throughout, so the OSC orientation target
+    # is constant for every phase. Using the canonical "gripper down" quat
+    # rather than the captured home quat avoids the earlier snapshot-timing /
+    # tilt issue.
+    down_quat_b = torch.tensor(GRIPPER_DOWN_QUAT, device=sim.device)
+
+    # ----- Key world-frame poses for the phase machine -----
+    # Grasp pose: hand position that puts the pads around the standing peg's
+    # grip point. The peg center is at PEG_PLACE_POS; hand sits above it.
+    peg_center_w = torch.tensor(PEG_PLACE_POS, device=sim.device).unsqueeze(0)
+    grasp_hand_pos = hand_pos_for_grasp(
+        peg_center_w, down_quat_b.unsqueeze(0)
+    )[0]                                            # [3]
+    approach_hand_pos = grasp_hand_pos.clone()
+    approach_hand_pos[2] += APPROACH_CLEARANCE     # straight up from grasp
+
+    # DMP endpoints in PEG-TIP world coordinates:
+    #   start = peg tip at the pick (top of the standing peg)
+    #   goal  = peg tip at the socket (rim top, or fully seated)
+    pick_tip_w = torch.tensor(
+        [PEG_PLACE_POS[0], PEG_PLACE_POS[1], PEG_PLACE_POS[2] + PEG_LENGTH / 2],
+        device=sim.device,
+    )
+    seat_tip_w = torch.tensor([SOCKET_X, SOCKET_Y, SEAT_TIP_Z], device=sim.device)
+    print(f"[info] DMP transports peg tip {pick_tip_w.tolist()} -> {seat_tip_w.tolist()}")
+
+    # Override the DMP's endpoints with the real scene geometry so the config's
+    # abstract start/goal map onto the actual peg + socket positions.
+    dmp.x_0 = pick_tip_w.clone()
+    dmp.x_goal = seat_tip_w.clone()
+
+    grip_target = finger_grip_target(scene.num_envs, len(finger_ids), sim.device)
+    open_target = torch.full(
+        (scene.num_envs, len(finger_ids)), 0.04, device=sim.device
+    )
+
     est_steps = int(tau / (sim_dt * args_cli.playback_speed))
-    print(f"[info] step-wise mode: hold static until step "
-          f"{args_cli.rollout_start_step}, then step DMP for ~{est_steps} ticks "
-          f"(tau={tau:.2f}s, speed={args_cli.playback_speed}), then hold goal.")
+    print(f"[info] phases: APPROACH -> DESCEND -> GRASP -> DMP(~{est_steps} ticks, "
+          f"tau={tau:.2f}s, speed={args_cli.playback_speed}) -> HOLD.")
 
-    # ----- Reusable command tensor. command[:, :3] is mutated each step to
-    # the current DMP waypoint; orientation stays at home_quat_b. -----
+    # ----- Reusable command + target tensors (orientation fixed down). -----
     command = torch.zeros(scene.num_envs, osc.action_dim, device=sim.device)
-    command[:, 3:7] = home_quat_b.unsqueeze(0).expand(scene.num_envs, -1)
-
+    command[:, 3:7] = down_quat_b.unsqueeze(0).expand(scene.num_envs, -1)
     ee_target_pose_b = torch.zeros(scene.num_envs, 7, device=sim.device)
-    ee_target_pose_b[:, 3:7] = home_quat_b.unsqueeze(0).expand(scene.num_envs, -1)
+    ee_target_pose_b[:, 3:7] = down_quat_b.unsqueeze(0).expand(scene.num_envs, -1)
 
     zero_joint_efforts = torch.zeros(scene.num_envs, robot.num_joints, device=sim.device)
 
-    # ----- Step-wise DMP execution state. -----
-    dmp_time = 0.0            # integrated DMP time (s) since rollout start
-    dmp_active = False        # has reset_step been called this cycle?
-    last_target_xyz = torch.tensor(STATIC_TARGET_POS, device=sim.device)
-    cycle_step = 0            # steps since last reset
+    # ----- Phase machine state. -----
+    # Phase boundaries (in steps since reset). Tune the budgets if a phase
+    # needs more settling time.
+    APPROACH_STEPS = 120
+    DESCEND_STEPS = 80
+    GRASP_STEPS = 40
+    PHASE_APPROACH_END = APPROACH_STEPS
+    PHASE_DESCEND_END = PHASE_APPROACH_END + DESCEND_STEPS
+    PHASE_GRASP_END = PHASE_DESCEND_END + GRASP_STEPS
+    # DMP rollout begins right after grasp completes.
+    rollout_start = PHASE_GRASP_END
+
+    dmp_time = 0.0
+    dmp_active = False
+    last_target_xyz = approach_hand_pos.clone()
+    cycle_step = 0
 
     count = 0
     while simulation_app.is_running():
         is_reset_step = (count % args_cli.reset_period) == 0
 
         if is_reset_step:
-            # ----- Periodic reset -----
+            # ----- Periodic reset: arm to default ready pose, peg back on the
+            # table at its pick location, fingers open. The phase machine
+            # re-runs approach→grasp→DMP from scratch. -----
             default_joint_pos = robot.data.default_joint_pos.clone()
             default_joint_vel = robot.data.default_joint_vel.clone()
             robot.write_joint_state_to_sim(default_joint_pos, default_joint_vel)
@@ -296,40 +343,54 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene,
             robot.write_data_to_sim()
             robot.reset()
             robot.update(sim_dt)
+            # Reset the peg to standing on the table (dynamic, zero velocity).
+            peg_reset_pose = torch.cat([
+                peg_center_w,
+                torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=sim.device),  # upright
+            ], dim=-1)
+            peg.write_root_pose_to_sim(peg_reset_pose)
+            peg.write_root_velocity_to_sim(
+                torch.zeros(scene.num_envs, 6, device=sim.device))
             cycle_step = 0
             dmp_time = 0.0
             dmp_active = False
-            last_target_xyz = torch.tensor(STATIC_TARGET_POS, device=sim.device)
+            last_target_xyz = approach_hand_pos.clone()
             print(f"[run] reset at step {count}")
 
-        # ----- Compute the current target position. -----
-        if cycle_step >= args_cli.rollout_start_step:
+        # ----- Phase machine: pick target hand position + finger command. -----
+        if cycle_step < PHASE_APPROACH_END:
+            phase = "APPROACH"
+            target_xyz = approach_hand_pos
+            finger_cmd = open_target
+        elif cycle_step < PHASE_DESCEND_END:
+            phase = "DESCEND"
+            target_xyz = grasp_hand_pos
+            finger_cmd = open_target
+        elif cycle_step < PHASE_GRASP_END:
+            phase = "GRASP"
+            target_xyz = grasp_hand_pos      # hold position while closing
+            finger_cmd = grip_target
+        else:
+            phase = "DMP"
+            finger_cmd = grip_target         # sustain grip through transport
             if not dmp_active:
-                # First tick of the rollout phase: (re)initialise the DMP
-                # integrator from the configured start/goal + policy weights.
                 dmp.reset_step(dmp_weights)
                 dmp_active = True
                 dmp_time = 0.0
-                print(f"[run] DMP step-wise rollout started at step {count}")
-
+                print(f"[run] DMP rollout started at step {count}")
             if (not args_cli.hold_after_tau) or (dmp_time < tau):
-                # Advance the DMP by one (speed-scaled) tick. The returned
-                # position is the OSC target directly — no interpolation.
                 step_dt = sim_dt * args_cli.playback_speed
-                pos, vel = dmp.step(step_dt)        # pos: [1, 3]
-                # DMP is built on the sim device in main(); the .to() is a
-                # cheap no-op guard in case a future caller changes that.
-                last_target_xyz = pos[0].to(sim.device)
+                tip_pos, _ = dmp.step(step_dt)            # [1, 3] peg-tip target
+                # Convert peg-tip target -> hand target for the OSC.
+                last_target_xyz = hand_pos_for_peg_tip(
+                    tip_pos.to(sim.device), down_quat_b.unsqueeze(0)
+                )[0]
                 dmp_time += step_dt
-            # else: hold last_target_xyz (DMP has converged to the goal).
-
             target_xyz = last_target_xyz
-        else:
-            # Static hover before the rollout phase.
-            target_xyz = torch.tensor(STATIC_TARGET_POS, device=sim.device)
 
-        ee_target_pose_b[:, 0:3] = target_xyz.unsqueeze(0).expand(scene.num_envs, -1)
-        command[:, 0:3] = ee_target_pose_b[:, 0:3]
+        # target_xyz is in WORLD frame (grasp/approach/DMP all produce world
+        # positions). Convert to base frame AFTER reading root_pose_w below.
+        target_xyz_w = target_xyz
 
         # ----- Read states. -----
         (
@@ -337,11 +398,20 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene,
             root_pose_w, ee_pose_w, joint_pos, joint_vel,
         ) = update_states(sim, scene, robot, ee_frame_idx, arm_joint_ids)
 
-        tip_pos_w = peg_tip_pose_from_hand(ee_pose_w[:, 0:3], ee_pose_w[:, 3:7])
+        # Convert the world-frame target into the robot base frame for the OSC.
+        target_pos_b, _ = subtract_frame_transforms(
+            root_pose_w[:, 0:3], root_pose_w[:, 3:7],
+            target_xyz_w.unsqueeze(0).expand(scene.num_envs, -1),
+            down_quat_b.unsqueeze(0).expand(scene.num_envs, -1),
+        )
+        ee_target_pose_b[:, 0:3] = target_pos_b
+        command[:, 0:3] = ee_target_pose_b[:, 0:3]
+
+        tip_pos_w = peg_tip_from_body(peg.data.root_pos_w, peg.data.root_quat_w)
         success, lateral_err, depth_frac = insertion_success(tip_pos_w)
 
         if count % 50 == 0:
-            print(f"[insert] tip_z={tip_pos_w[0, 2]:.3f} "
+            print(f"[{phase}] tip_z={tip_pos_w[0, 2]:.3f} "
                   f"lateral={lateral_err[0]*1000:.1f}mm "
                   f"depth_frac={depth_frac[0]:+.2f} "
                   f"success={bool(success[0])}")
@@ -369,6 +439,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene,
         )
 
         robot.set_joint_effort_target(joint_efforts, joint_ids=arm_joint_ids)
+        robot.set_joint_position_target(finger_cmd, joint_ids=finger_ids)  # phase-dependent: open during approach, grip after
         robot.write_data_to_sim()
 
         # ----- Markers. -----
@@ -381,8 +452,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene,
         goal_marker.visualize(ee_target_pose_w[:, 0:3], ee_target_pose_w[:, 3:7])
 
         if count % 100 == 0:
-            mode = ("DMP" if cycle_step >= args_cli.rollout_start_step else "hold")
-            print(f"[debug] step {count} mode={mode} dmp_t={dmp_time:.2f}/{tau:.2f} "
+            print(f"[debug] step {count} phase={phase} dmp_t={dmp_time:.2f}/{tau:.2f} "
                   f"ee_pos_b={ee_pose_b[0, 0:3].tolist()} "
                   f"target_pos_b={ee_target_pose_b[0, 0:3].tolist()}")
 

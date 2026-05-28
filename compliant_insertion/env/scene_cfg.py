@@ -98,7 +98,7 @@ PEG_LENGTH = 0.05
 #   close-running   (H7/g6)   → ~0.02 mm
 # For sim, anything below ~0.5 mm gets numerically nasty without sub-stepping
 # and contact tuning. Start generous, tighten once the DMP rollout is clean.
-HOLE_CLEARANCE = 0.003        # 3 mm — generous, easy for the DMP to enter
+HOLE_CLEARANCE = 0.01        # 3 mm — generous, easy for the DMP to enter
 HOLE_RADIUS = PEG_RADIUS + HOLE_CLEARANCE
 HOLE_DEPTH = 0.04             # how deep the peg can sink before bottoming out
 
@@ -115,14 +115,38 @@ RIM_WALL_THICKNESS = (SOCKET_BLOCK_SIZE_XY - 2 * HOLE_RADIUS) / 2  # auto-fit
 RIM_HEIGHT = HOLE_DEPTH
 
 # ─── Placement. ──────────────────────────────────────────────────────────────
-# Where the fixture sits on the table mount. The Z values below assume the
-# `Stand` USD puts its top surface roughly at z=0; if you swap the mount,
-# re-measure and adjust SOCKET_BASE_Z.
-SOCKET_X = 0.4
-SOCKET_Y = 0.3
-SOCKET_BASE_Z = 0.36          # top of the table mount
+# The work surface. Peg and socket are placed at two INDEPENDENT positions on
+# this flat tabletop, so the task is a genuine "pick the peg here, insert it
+# there" motion rather than the peg starting in the gripper. Pick any two
+# constant positions you like via PEG_PLACE_X/Y and SOCKET_X/Y below.
+#
+# TABLE_TOP_Z is the height of the work surface in world frame. It must match
+# the top of whatever the robot is standing relative to; with the `Stand`
+# mount scaled ×2 the Franka base sits such that ~0.36 is a reachable,
+# table-height plane. Both the peg and the socket rest ON this plane.
+TABLE_TOP_Z = 0.36
 
-# Layered Z stack:
+# ----- Socket location (where the peg gets inserted) -----
+SOCKET_X = 0.45
+SOCKET_Y = 0.25
+SOCKET_BASE_Z = TABLE_TOP_Z   # socket base block rests on the table
+
+# ----- Peg location (where the peg starts, standing on the table) -----
+# Chosen on the opposite side of the workspace from the socket so the DMP
+# has a meaningful lateral transport to do. Both are arbitrary constants —
+# move them anywhere reachable.
+PEG_PLACE_X = 0.45
+PEG_PLACE_Y = -0.20
+# The peg stands upright on the table, so its CENTER is half a length up.
+PEG_PLACE_Z = TABLE_TOP_Z + PEG_LENGTH / 2
+PEG_PLACE_POS = (PEG_PLACE_X, PEG_PLACE_Y, PEG_PLACE_Z)
+
+# Table slab dimensions (a thin visual+collision box under the work surface).
+TABLE_SIZE_X = 0.5
+TABLE_SIZE_Y = 1.0
+TABLE_THICKNESS = 0.02
+
+# Layered Z stack for the socket fixture:
 #   [base_z, base_z + block_height]   → solid socket block
 #   [base_z + block_height, ...+rim]  → rim walls with hole
 SOCKET_BLOCK_TOP_Z = SOCKET_BASE_Z + SOCKET_BLOCK_HEIGHT
@@ -142,32 +166,49 @@ HOLE_CENTER_BOTTOM = (SOCKET_X, SOCKET_Y, SOCKET_BLOCK_TOP_Z)
 # defined to be aligned with panda_hand +Z. The constants below describe
 # where along that +Z the peg sits relative to the hand origin.
 #
-# PANDA_FINGERTIP_OFFSET_Z is the well-known TCP offset for the default Franka
-# hand: the distance from the `panda_hand` link origin to the tip of the
-# closed fingers. The peg's base sits at the fingertip plane (i.e. the peg
-# "starts where the fingers end") so its body extends from there along +Z.
-PANDA_FINGERTIP_OFFSET_Z = 0.1034  # meters; standard Franka panda_hand → TCP
+# Two distinct landmarks along panda_hand +Z, do NOT conflate them:
+#
+#   PANDA_FINGERTIP_OFFSET_Z  — the TCP, i.e. the very tip of the closed
+#       fingers. Correct for "where the gripper's working point is", but the
+#       WRONG place to put a peg you want to grip: a peg centered here sticks
+#       out past the fingers and the pads close on empty space.
+#
+#   PANDA_PAD_CENTER_OFFSET_Z — the middle of the finger PADS, where the
+#       gripping contact actually happens. The peg's CENTER must sit here so
+#       the pads close on the peg's shaft. This is the landmark grasp
+#       placement is built around.
+PANDA_FINGERTIP_OFFSET_Z = 0.1034   # panda_hand → TCP (tip of closed fingers)
+PANDA_PAD_CENTER_OFFSET_Z = 0.1    # panda_hand → center of finger pad contact
 
-# Peg base (the end held by the gripper) and tip (the end that enters the hole)
-# expressed as offsets in the panda_hand frame.
-PEG_BASE_OFFSET_Z = PANDA_FINGERTIP_OFFSET_Z
-PEG_TIP_OFFSET_Z = PEG_BASE_OFFSET_Z + PEG_LENGTH
+# The peg is gripped near its TOP end, not its center, so that most of the
+# peg protrudes past the fingertips and the tip can reach into the hole
+# without the fingers colliding with the socket rim. GRIP_FRACTION is how far
+# down from the peg's top the pads contact: 0.0 = grip the very top, 0.5 =
+# grip the center. Keep it small so the tip sticks out well past the TCP.
+GRIP_FRACTION = 0.15  # pads grip 15% down from the peg's top end
 
-# Hand-frame offset vector for the peg tip. Use this to convert peg-tip
-# targets to hand targets in downstream code:
+# The pad-contact point on the peg, measured from the peg's top end.
+_grip_from_top = GRIP_FRACTION * PEG_LENGTH
+# Peg body CENTER offset along hand +Z: the pads sit at PANDA_PAD_CENTER, and
+# the peg center is (PEG_LENGTH/2 - _grip_from_top) further along +Z from the
+# grip point (toward the tip).
+PEG_BODY_CENTER_HAND_Z = PANDA_PAD_CENTER_OFFSET_Z + (PEG_LENGTH / 2 - _grip_from_top)
+
+# Peg base (gripper-side end) and tip (insertion end) as offsets in the hand
+# frame, DERIVED from the grasp placement. The peg points along +Z.
+PEG_TIP_OFFSET_Z = PEG_BODY_CENTER_HAND_Z + PEG_LENGTH / 2
+PEG_BASE_OFFSET_Z = PEG_BODY_CENTER_HAND_Z - PEG_LENGTH / 2
+
+# Hand-frame offset vectors. Use PEG_TIP_OFFSET_HAND to convert peg-tip
+# targets to hand targets in downstream trajectory code:
 #
 #     from isaaclab.utils.math import quat_apply
-#     tip_offset_b = quat_apply(hand_quat_b, PEG_TIP_OFFSET_HAND_TENSOR)
+#     tip_offset_b = quat_apply(hand_quat_b, torch.tensor(PEG_TIP_OFFSET_HAND))
 #     hand_target_pos_b = peg_tip_target_pos_b - tip_offset_b
 #
 # When orientation is fixed at home_quat_b, precompute tip_offset_b once.
 PEG_TIP_OFFSET_HAND = (0.0, 0.0, PEG_TIP_OFFSET_Z)
 PEG_BASE_OFFSET_HAND = (0.0, 0.0, PEG_BASE_OFFSET_Z)
-
-# Peg body center in the hand frame (cylinder spawn pose). The cylinder
-# primitive is centered on its origin, so to place its base at PEG_BASE_OFFSET_Z
-# we shift the center up by half the length.
-PEG_BODY_CENTER_HAND_Z = PEG_BASE_OFFSET_Z + PEG_LENGTH / 2
 
 # ─── Grasp / friction parameters ──────────────────────────────────────────────
 # The peg is a DYNAMIC body held by friction. These coefficients are high on
@@ -179,6 +220,31 @@ PEG_BODY_CENTER_HAND_Z = PEG_BASE_OFFSET_Z + PEG_LENGTH / 2
 PEG_FRICTION_STATIC = 1.2
 PEG_FRICTION_DYNAMIC = 1.0
 PEG_RESTITUTION = 0.0  # no bounce — dead contacts settle faster
+
+# Franka finger joint position that just grips a peg of radius PEG_RADIUS.
+# Each panda_finger_joint is prismatic and measures the half-opening (the
+# finger's displacement from the centerline), so to contact a cylinder of
+# radius r each finger sits at ~r. Subtract a small squeeze so the pads load
+# the peg (friction needs normal force) rather than barely kissing it.
+FINGER_SQUEEZE = 0.0015  # 1.5 mm of preload per finger
+FINGER_GRIP_POS = max(PEG_RADIUS - FINGER_SQUEEZE, 0.0)
+
+
+def finger_grip_target(num_envs, num_finger_joints, device, dtype=None):
+    """Joint-position target [N, num_finger_joints] that grips the peg.
+
+    Use this both for the held-state write (so the fingers START closed on
+    the peg with zero penetration) and as the per-step sustained-squeeze
+    target in the main loop.
+    """
+    import torch
+
+    return torch.full(
+        (num_envs, num_finger_joints),
+        FINGER_GRIP_POS,
+        device=device,
+        dtype=dtype if dtype is not None else torch.float32,
+    )
 
 
 def peg_grasp_pose_from_hand(hand_pos_w, hand_quat_w):
@@ -219,6 +285,59 @@ def peg_tip_from_body(peg_pos_w, peg_quat_w):
         dtype=peg_pos_w.dtype,
     ).expand_as(peg_pos_w)
     return peg_pos_w + quat_apply(peg_quat_w, half_len)
+
+
+# ─── Down-pointing gripper orientation (base frame) ───────────────────────────
+# Quaternion (w, x, y, z) for the gripper pointing straight down: panda_hand
+# +Z aligned with world -Z. This is a π rotation about the base X axis. Used as
+# the target orientation for both the grasp-approach and the DMP rollout, so
+# the peg stays vertical throughout.
+GRIPPER_DOWN_QUAT = (0.0, 1.0, 0.0, 0.0)
+
+
+def hand_pos_for_peg_tip(tip_pos_w, hand_quat_w):
+    """Hand position (world) that places the peg TIP at tip_pos_w.
+
+    Inverse of peg_tip_from_body composed with the grasp offset: given where
+    we want the peg tip and the (fixed, down-pointing) hand orientation,
+    return where the hand origin must be. Used to convert DMP waypoints
+    (expressed as peg-tip positions) into OSC hand targets.
+
+        hand_pos_w = tip_pos_w - R(hand_quat_w) @ (0, 0, PEG_TIP_OFFSET_Z)
+    """
+    import torch
+    from isaaclab.utils.math import quat_apply
+
+    tip_offset_hand = torch.tensor(
+        [0.0, 0.0, PEG_TIP_OFFSET_Z],
+        device=tip_pos_w.device,
+        dtype=tip_pos_w.dtype,
+    ).expand_as(tip_pos_w)
+    tip_offset_w = quat_apply(hand_quat_w, tip_offset_hand)
+    return tip_pos_w - tip_offset_w
+
+
+def hand_pos_for_grasp(peg_center_pos_w, hand_quat_w):
+    """Hand position (world) to grasp a peg whose CENTER is at peg_center_pos_w.
+
+    The peg center sits PEG_BODY_CENTER_HAND_Z along the hand +Z, so the hand
+    origin is that far back along -Z (for a down-pointing gripper, that means
+    the hand sits ABOVE the peg center). Use this to drive the empty gripper
+    to the grasp pose during the approach phase, and to align the peg-on-table
+    so the pads will close around its grip point.
+
+        hand_pos_w = peg_center_pos_w - R(hand_quat_w) @ (0, 0, PEG_BODY_CENTER_HAND_Z)
+    """
+    import torch
+    from isaaclab.utils.math import quat_apply
+
+    offset_hand = torch.tensor(
+        [0.0, 0.0, PEG_BODY_CENTER_HAND_Z],
+        device=peg_center_pos_w.device,
+        dtype=peg_center_pos_w.dtype,
+    ).expand_as(peg_center_pos_w)
+    offset_w = quat_apply(hand_quat_w, offset_hand)
+    return peg_center_pos_w - offset_w
 
 # ─── Rim wall poses ──────────────────────────────────────────────────────────
 # Four walls, axis-aligned, surrounding a square that inscribes the hole.
@@ -375,6 +494,26 @@ class InsertionSceneCfg(InteractiveSceneCfg):
         ),
     )
 
+    # ----- Work surface (flat table the peg + socket rest on) -----
+    # A thin static slab whose TOP sits at TABLE_TOP_Z. The peg stands on this
+    # and the socket fixture is bolted to it. Centered in front of the robot
+    # spanning the peg↔socket workspace.
+    worktable = AssetBaseCfg(
+        prim_path="{ENV_REGEX_NS}/WorkTable",
+        spawn=sim_utils.CuboidCfg(
+            size=(TABLE_SIZE_X, TABLE_SIZE_Y, TABLE_THICKNESS),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.45, 0.4, 0.35)),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
+            activate_contact_sensors=False,
+        ),
+        init_state=AssetBaseCfg.InitialStateCfg(
+            # Center the slab so its top face is at TABLE_TOP_Z. Placed forward
+            # (+X) of the robot base so it covers both peg and socket.
+            pos=(0.45, 0.0, TABLE_TOP_Z - TABLE_THICKNESS / 2),
+        ),
+    )
+
     # ----- Socket base block (the flat fixture the rim walls sit on) -----
     socket_base = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/SocketBase",
@@ -470,34 +609,25 @@ class InsertionSceneCfg(InteractiveSceneCfg):
     )
 
     # ----- Initial joint configuration -----
-    # Override the default Franka "ready" pose so the arm starts to the side
-    # of the socket, not above it — this matches the spirit of a DMP rollout
-    # where the start pose is "after grasping the peg, before approaching".
+    # We DON'T hand-tune a start pose anymore. The episode begins with the
+    # gripper EMPTY at the default Franka ready pose; the runner's APPROACH
+    # phase then drives the gripper (via OSC) to the peg's grasp pose, closes
+    # the fingers, and only then runs the DMP from peg → socket. So the
+    # default ready pose is fine as the reset configuration — OSC handles
+    # getting to the peg. (Keeping the asset default also avoids the orientation
+    # / nullspace issues that a mismatched hand-tuned config caused earlier.)
     #
-    # These angles were tuned by hand against the current socket position
-    # (SOCKET_X=0.4, SOCKET_Y=0.3). They put the hand roughly at
-    # (x≈0.4, y≈0.1, z≈0.51) in base frame — i.e. 20 cm to the −Y side of
-    # the socket, ~10 cm above the rim top — pointing down with the same
-    # orientation as the default ready pose. Adjust if you reposition the
-    # socket or want a different start.
-    #
-    # If you want a true Cartesian start specification ("hand at exactly
-    # this XYZ"), the right next step is to run an IK solver once offline
-    # (Isaac Lab's `DifferentialIKController` or `pinocchio`) and paste
-    # the resulting joint angles here. For pass-2 the hand-tuned values
-    # below are good enough; the DMP doesn't care that the start is
-    # 5 mm off as long as it's reproducible.
+    # Fingers start OPEN so the approach can lower around the standing peg.
     robot.init_state.joint_pos = {
-        "panda_joint1": 0.6,     # rotate base toward +X+Y quadrant
-        "panda_joint2": 0.3,     # shoulder pitch up (less squat than default)
+        "panda_joint1": 0.0,
+        "panda_joint2": -0.569,
         "panda_joint3": 0.0,
-        "panda_joint4": -2.0,    # less elbow bend (was -2.81)
+        "panda_joint4": -2.810,
         "panda_joint5": 0.0,
-        "panda_joint6": 2.3,     # wrist pitch to keep tip pointing down
-        "panda_joint7": 0.741,   # default wrist roll (peg is symmetric)
-        # Fingers — close them so the gripper "holds" the peg visually.
-        "panda_finger_joint1": 0.0,
-        "panda_finger_joint2": 0.0,
+        "panda_joint6": 3.037,
+        "panda_joint7": 0.741,
+        "panda_finger_joint1": 0.04,   # open
+        "panda_finger_joint2": 0.04,   # open
     }
 
     # ----- Peg (DYNAMIC rigid body, held by friction) -----
@@ -532,9 +662,11 @@ class InsertionSceneCfg(InteractiveSceneCfg):
                 max_depenetration_velocity=1.0,
             ),
         ),
-        # Placeholder spawn; the runner writes the real grasp pose on the
-        # first reset (peg centered between the fingers).
+        # Spawn the peg STANDING UPRIGHT on the table at its pick location.
+        # The runner's approach phase drives the empty gripper here, closes on
+        # it, then the DMP carries it to the socket. Identity orientation =
+        # cylinder's long axis along world +Z (upright).
         init_state=RigidObjectCfg.InitialStateCfg(
-            pos=(0.0, 0.0, 1.0),
+            pos=PEG_PLACE_POS,
         ),
     )
