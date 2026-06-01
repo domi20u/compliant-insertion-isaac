@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Large data + model artifacts (kept out of git)
+/data/
+/reports/
+/assets/dp_models/
+*.hdf5
+*.pt
+*.bak
+
+# Debug scratch
+/debug_rgb.png
